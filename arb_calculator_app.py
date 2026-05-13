@@ -54,22 +54,32 @@ def get_yes_token_id(market):
 
 
 def get_orderbook(token_id):
-    r = requests.get(BOOK_URL, params={"token_id": token_id}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.get(BOOK_URL, params={"token_id": token_id}, timeout=10)
 
-    asks = data.get("asks", [])
+        if r.status_code != 200:
+            return []
 
-    clean_asks = []
+        data = r.json()
+        asks = data.get("asks", [])
 
-    for ask in asks:
-        try:
-            price = float(ask["price"])
-            size = float(ask["size"])
-            if price > 0 and size > 0:
-                clean_asks.append({"price": price, "size": size})
-        except Exception:
-            continue
+        clean_asks = []
+
+        for ask in asks:
+            try:
+                price = float(ask["price"])
+                size = float(ask["size"])
+                if price > 0 and size > 0:
+                    clean_asks.append({"price": price, "size": size})
+            except:
+                continue
+
+        clean_asks.sort(key=lambda x: x["price"])
+
+        return clean_asks
+
+    except:
+        return []
 
     # Wichtig: billigste Ask-Level zuerst kaufen
     clean_asks.sort(key=lambda x: x["price"])
