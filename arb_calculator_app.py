@@ -1,18 +1,23 @@
 import json
+import re
 import requests
 import pandas as pd
 import streamlit as st
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
-BOOK_URL = "https://clob.polymarket.com/book"
 
-st.set_page_config(page_title="Polymarket Real ROI Rechner", layout="wide")
-st.title("Polymarket REAL ROI Rechner")
+st.set_page_config(page_title="Polymarket Top-N Rechner", layout="wide")
+
+st.title("Polymarket Top-N ROI Rechner")
 
 url = st.text_input("Polymarket Event-Link")
-top_n = st.slider("Top Teams", 2, 20, 5)
-bankroll = st.number_input("Gesamteinsatz ($)", min_value=1.0, value=100.0, step=10.0)
+top_n = st.number_input("Anzahl Top Teams", min_value=1, max_value=20, value=5, step=1)
+bankroll = st.number_input("Einsatz in $", min_value=1.0, value=100.0, step=10.0)
 
+def extract_slug(url_or_slug):
+    if "/event/" in url_or_slug:
+        return url_or_slug.split("/event/")[1].split("?")[0].split("#")[0].strip("/")
+    return url_or_slug.strip()
 
 def parse_list(value):
     if isinstance(value, list):
@@ -24,226 +29,97 @@ def parse_list(value):
             return []
     return []
 
-
-def extract_slug(value):
-    if "/event/" in value:
-        return value.split("/event/")[1].split("?")[0].split("#")[0].strip("/")
-    return value.strip()
-
-
-def get_event(slug):
-    r = requests.get(EVENTS_URL, params={"slug": slug, "limit": 1}, timeout=20)
+def get_event_by_slug(slug):
+    params = {"slug": slug, "limit": 1}
+    r = requests.get(EVENTS_URL, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
 
     if isinstance(data, list) and data:
         return data[0]
-
+    if isinstance(data, dict):
+        return data
     return None
 
-
-def get_yes_token_id(market):
+def get_yes_price(market):
     outcomes = parse_list(market.get("outcomes"))
-    token_ids = parse_list(market.get("clobTokenIds"))
+    prices = parse_list(market.get("outcomePrices"))
 
-    for outcome, token_id in zip(outcomes, token_ids):
+    for outcome, price in zip(outcomes, prices):
         if str(outcome).lower() == "yes":
-            return str(token_id)
+            return float(price)
 
     return None
 
-
-def get_orderbook(token_id):
-    try:
-        r = requests.get(BOOK_URL, params={"token_id": token_id}, timeout=10)
-
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-        asks = data.get("asks", [])
-
-        clean_asks = []
-
-        for ask in asks:
-            try:
-                price = float(ask["price"])
-                size = float(ask["size"])
-                if price > 0 and size > 0:
-                    clean_asks.append({"price": price, "size": size})
-            except:
-                continue
-
-        clean_asks.sort(key=lambda x: x["price"])
-
-        return clean_asks
-
-    except:
-        return []
-
-    # Wichtig: billigste Ask-Level zuerst kaufen
-    clean_asks.sort(key=lambda x: x["price"])
-
-    return clean_asks
-
-
-def cost_to_buy_shares(asks, shares_needed):
-    remaining = shares_needed
-    cost = 0.0
-
-    for level in asks:
-        take = min(remaining, level["size"])
-        cost += take * level["price"]
-        remaining -= take
-
-        if remaining <= 1e-9:
-            return cost
-
-    return None  # nicht genug Liquidität
-
-
-def total_depth(asks):
-    return sum(level["size"] for level in asks)
-
-
-def best_ask(asks):
-    if not asks:
-        return None
-    return asks[0]["price"]
-
-
-def find_equal_payout(selected, bankroll):
-    """
-    Sucht die maximale gleiche Auszahlung q.
-    Für jedes Team kaufen wir q YES-Shares.
-    Wenn eins der Teams gewinnt, bekommst du q Dollar.
-    """
-    max_possible_q = min(total_depth(team["asks"]) for team in selected)
-
-    low = 0.0
-    high = max_possible_q
-
-    for _ in range(60):
-        mid = (low + high) / 2
-
-        total_cost = 0.0
-        possible = True
-
-        for team in selected:
-            cost = cost_to_buy_shares(team["asks"], mid)
-
-            if cost is None:
-                possible = False
-                break
-
-            total_cost += cost
-
-        if possible and total_cost <= bankroll:
-            low = mid
-        else:
-            high = mid
-
-    payout = low
-
-    stakes = []
-    total_cost = 0.0
-
-    for team in selected:
-        cost = cost_to_buy_shares(team["asks"], payout)
-        avg_price = cost / payout if payout > 0 else None
-        total_cost += cost
-
-        stakes.append({
-            "Team / Markt": team["name"],
-            "Best Ask": best_ask(team["asks"]),
-            "Avg Buy Price": avg_price,
-            "Shares": payout,
-            "Stake $": cost,
-            "Depth Shares": total_depth(team["asks"]),
-            "Ausführbar": cost is not None,
-        })
-
-    return payout, total_cost, stakes
-
+def market_name(market):
+    return market.get("question") or market.get("title") or market.get("slug")
 
 if st.button("Berechnen"):
     if not url:
         st.error("Bitte Polymarket-Link einfügen.")
-        st.stop()
-
-    try:
+    else:
         slug = extract_slug(url)
-        event = get_event(slug)
 
-        if not event:
-            st.error("Event nicht gefunden.")
-            st.stop()
+        try:
+            event = get_event_by_slug(slug)
 
-        markets = event.get("markets", [])
-        teams = []
+            if not event:
+                st.error("Event nicht gefunden.")
+                st.stop()
 
-        for market in markets:
-            token_id = get_yes_token_id(market)
+            markets = event.get("markets", [])
+            teams = []
 
-            if not token_id:
-                continue
+            for market in markets:
+                price = get_yes_price(market)
 
-            asks = get_orderbook(token_id)
+                if price is None or price <= 0:
+                    continue
 
-            if not asks:
-                continue
+                teams.append({
+                    "Team / Markt": market_name(market),
+                    "YES Preis": price,
+                })
 
-            name = market.get("question") or market.get("title") or market.get("slug")
+            if not teams:
+                st.error("Keine YES-Preise gefunden.")
+                st.stop()
 
-            teams.append({
-                "name": name,
-                "token_id": token_id,
-                "asks": asks,
-                "best_ask": best_ask(asks),
-            })
+            teams = sorted(teams, key=lambda x: x["YES Preis"], reverse=True)
+            top = teams[:int(top_n)]
 
-        if len(teams) < top_n:
-            st.error("Nicht genug Märkte mit Orderbook-Daten gefunden.")
-            st.stop()
+            yes_sum = sum(t["YES Preis"] for t in top)
+            roi = (1 / yes_sum) - 1
+            payout = bankroll / yes_sum
+            profit = payout - bankroll
 
-        # Top Teams = höchste YES-Wahrscheinlichkeit = höchster Best Ask
-        teams.sort(key=lambda x: x["best_ask"], reverse=True)
-        selected = teams[:top_n]
+            rows = []
 
-        payout, real_cost, stake_rows = find_equal_payout(selected, bankroll)
+            for t in top:
+                stake = (t["YES Preis"] / yes_sum) * bankroll
+                rows.append({
+                    "Team / Markt": t["Team / Markt"],
+                    "YES Preis": round(t["YES Preis"], 4),
+                    "Stake $": round(stake, 2),
+                    "Payout wenn Treffer $": round(stake / t["YES Preis"], 2),
+                })
 
-        if payout <= 0:
-            st.error("Nicht genug Liquidität für Berechnung.")
-            st.stop()
+            df = pd.DataFrame(rows)
 
-        profit = payout - real_cost
-        roi = profit / real_cost if real_cost > 0 else 0
-        implied_sum = real_cost / payout
+            st.subheader(event.get("title") or slug)
 
-        st.subheader(event.get("title") or slug)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Summe Top N", round(yes_sum, 4))
+            col2.metric("ROI", f"{roi * 100:.2f}%")
+            col3.metric("Payout", f"${payout:.2f}")
+            col4.metric("Profit", f"${profit:.2f}")
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Real Cost", f"${real_cost:.2f}")
-        col2.metric("Payout wenn Top-N gewinnt", f"${payout:.2f}")
-        col3.metric("Real Profit", f"${profit:.2f}")
-        col4.metric("Real ROI", f"{roi * 100:.2f}%")
+            st.dataframe(df, use_container_width=True)
 
-        st.metric("Effektive Summe", f"{implied_sum:.4f}")
+            if yes_sum >= 1:
+                st.warning("Top-N-Summe ist >= 1. Kein positiver ROI.")
+            else:
+                st.success("Top-N-Summe ist < 1. Positiver theoretischer ROI.")
 
-        df = pd.DataFrame(stake_rows)
-
-        df["Best Ask"] = df["Best Ask"].round(4)
-        df["Avg Buy Price"] = df["Avg Buy Price"].round(4)
-        df["Shares"] = df["Shares"].round(2)
-        df["Stake $"] = df["Stake $"].round(2)
-        df["Depth Shares"] = df["Depth Shares"].round(2)
-
-        st.dataframe(df, use_container_width=True)
-
-        if roi > 0:
-            st.success("Positiver realer ROI auf Basis der aktuellen Orderbook-Tiefe.")
-        else:
-            st.warning("Kein positiver realer ROI nach Orderbook-Tiefe.")
-
-    except Exception as e:
-        st.error(f"Fehler: {e}")
+        except Exception as e:
+            st.error(f"Fehler: {e}")
