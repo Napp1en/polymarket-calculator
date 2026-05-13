@@ -1,125 +1,116 @@
-import json
-import re
 import requests
 import pandas as pd
 import streamlit as st
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
+ORDERBOOK_URL = "https://clob.polymarket.com/book"
 
-st.set_page_config(page_title="Polymarket Top-N Rechner", layout="wide")
+st.set_page_config(page_title="Polymarket Real ROI Rechner", layout="wide")
 
-st.title("Polymarket Top-N ROI Rechner")
+st.title("Polymarket REAL ROI Rechner")
 
 url = st.text_input("Polymarket Event-Link")
-top_n = st.number_input("Anzahl Top Teams", min_value=1, max_value=20, value=5, step=1)
-bankroll = st.number_input("Einsatz in $", min_value=1.0, value=100.0, step=10.0)
+top_n = st.slider("Top Teams", 2, 10, 5)
+bankroll = st.number_input("Einsatz ($)", value=100.0)
 
-def extract_slug(url_or_slug):
-    if "/event/" in url_or_slug:
-        return url_or_slug.split("/event/")[1].split("?")[0].split("#")[0].strip("/")
-    return url_or_slug.strip()
+# -------------------------
+# HELPERS
+# -------------------------
 
-def parse_list(value):
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except Exception:
-            return []
-    return []
+def extract_slug(url):
+    return url.split("/event/")[1].split("?")[0]
 
-def get_event_by_slug(slug):
-    params = {"slug": slug, "limit": 1}
-    r = requests.get(EVENTS_URL, params=params, timeout=20)
+def get_event(slug):
+    r = requests.get(EVENTS_URL, params={"slug": slug})
     r.raise_for_status()
-    data = r.json()
+    return r.json()[0]
 
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        return data
-    return None
+def get_best_ask(token_id):
+    try:
+        r = requests.get(f"{ORDERBOOK_URL}?token_id={token_id}")
+        data = r.json()
 
-def get_yes_price(market):
-    outcomes = parse_list(market.get("outcomes"))
-    prices = parse_list(market.get("outcomePrices"))
+        asks = data.get("asks", [])
+        if not asks:
+            return None, 0
 
-    for outcome, price in zip(outcomes, prices):
-        if str(outcome).lower() == "yes":
-            return float(price)
+        best_ask = float(asks[0]["price"])
+        size = float(asks[0]["size"])
 
-    return None
+        return best_ask, size
+    except:
+        return None, 0
 
-def market_name(market):
-    return market.get("question") or market.get("title") or market.get("slug")
+# -------------------------
+# MAIN
+# -------------------------
 
 if st.button("Berechnen"):
-    if not url:
-        st.error("Bitte Polymarket-Link einfügen.")
-    else:
-        slug = extract_slug(url)
 
-        try:
-            event = get_event_by_slug(slug)
+    slug = extract_slug(url)
+    event = get_event(slug)
 
-            if not event:
-                st.error("Event nicht gefunden.")
-                st.stop()
+    markets = event.get("markets", [])
 
-            markets = event.get("markets", [])
-            teams = []
+    rows = []
 
-            for market in markets:
-                price = get_yes_price(market)
+    for m in markets:
+        token_ids = m.get("clobTokenIds", [])
 
-                if price is None or price <= 0:
-                    continue
+        if not token_ids:
+            continue
 
-                teams.append({
-                    "Team / Markt": market_name(market),
-                    "YES Preis": price,
-                })
+        # YES ist immer erstes Token (meistens)
+        token_id = token_ids[0]
 
-            if not teams:
-                st.error("Keine YES-Preise gefunden.")
-                st.stop()
+        price, size = get_best_ask(token_id)
 
-            teams = sorted(teams, key=lambda x: x["YES Preis"], reverse=True)
-            top = teams[:int(top_n)]
+        if price is None:
+            continue
 
-            yes_sum = sum(t["YES Preis"] for t in top)
-            roi = (1 / yes_sum) - 1
-            payout = bankroll / yes_sum
-            profit = payout - bankroll
+        rows.append({
+            "Team": m.get("question"),
+            "Ask Price": price,
+            "Liquidity": size
+        })
 
-            rows = []
+    if not rows:
+        st.error("Keine Orderbook Daten gefunden")
+        st.stop()
 
-            for t in top:
-                stake = (t["YES Preis"] / yes_sum) * bankroll
-                rows.append({
-                    "Team / Markt": t["Team / Markt"],
-                    "YES Preis": round(t["YES Preis"], 4),
-                    "Stake $": round(stake, 2),
-                    "Payout wenn Treffer $": round(stake / t["YES Preis"], 2),
-                })
+    df = pd.DataFrame(rows)
 
-            df = pd.DataFrame(rows)
+    # sortiere nach niedrigstem Preis (beste Value)
+    df = df.sort_values("Ask Price")
 
-            st.subheader(event.get("title") or slug)
+    top = df.head(top_n)
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Summe Top N", round(yes_sum, 4))
-            col2.metric("ROI", f"{roi * 100:.2f}%")
-            col3.metric("Payout", f"${payout:.2f}")
-            col4.metric("Profit", f"${profit:.2f}")
+    sum_prices = top["Ask Price"].sum()
+    roi = (1 / sum_prices) - 1
 
-            st.dataframe(df, use_container_width=True)
+    payout = bankroll / sum_prices
+    profit = payout - bankroll
 
-            if yes_sum >= 1:
-                st.warning("Top-N-Summe ist >= 1. Kein positiver ROI.")
-            else:
-                st.success("Top-N-Summe ist < 1. Positiver theoretischer ROI.")
+    # Stake Berechnung
+    top["Stake"] = (top["Ask Price"] / sum_prices) * bankroll
+    top["Payout if Win"] = top["Stake"] / top["Ask Price"]
 
-        except Exception as e:
+    st.subheader(event.get("title"))
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Summe Preise", round(sum_prices, 4))
+    col2.metric("ROI", f"{roi*100:.2f}%")
+    col3.metric("Profit", f"${profit:.2f}")
+
+    st.dataframe(top, use_container_width=True)
+
+    # Liquidity Check
+    st.subheader("Liquidity Check")
+
+    for _, row in top.iterrows():
+        if row["Liquidity"] < row["Stake"]:
+            st.warning(f"{row['Team']} hat zu wenig Liquidity!")
+        else:
+            st.success(f"{row['Team']} ist ausführbar")
             st.error(f"Fehler: {e}")
